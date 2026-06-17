@@ -1,0 +1,96 @@
+# 法律RAG知识库配置
+
+# 应用配置
+app:
+  name: "法律RAG知识库"
+  version: "1.0.0"
+  debug: true
+
+# 文档处理配置
+document:
+  # 文档存放目录
+  data_dir: "./data"
+  # 支持的文件格式
+  supported_formats:
+    - ".pdf"
+    - ".docx"
+    - ".doc"
+    - ".md"
+    - ".txt"
+  # 分块配置
+  chunk:
+    size: 500        # 分块大小（字符数）
+    overlap: 100     # 重叠大小
+    # 法律文档特殊分块：按条款分割
+    legal_split: true
+
+# 向量存储配置
+vector_store:
+  # ChromaDB配置
+  chroma:
+    persist_dir: "./vector_db"
+    collection_name: "legal_documents"
+  # Embedding模型配置
+  embedding:
+    # bge(BAAI/bge-small-zh-v1.5,推荐) / lightweight(sklearn Hash) / chromadb(ONNX) / openai(API)
+    provider: "bge"
+    # 模型名称
+    model_name: "BAAI/bge-small-zh-v1.5"
+    device: "cpu"  # cpu 或 cuda
+
+# 检索配置
+retrieval:
+  # 检索结果数量
+  top_k: 5
+  # 混合检索权重（RRF 融合中的相对权重）
+  hybrid_weights:
+    dense: 0.5
+    sparse: 0.5
+  # RRF 平滑常数
+  rrf_k: 60
+
+# LLM配置
+llm:
+  # 提供商：openai（兼容DeepSeek）或 ollama
+  provider: "openai"
+  # OpenAI/DeepSeek配置
+  openai:
+    model: "deepseek-v4-flash"
+    temperature: 0.3
+    max_tokens: 2000
+    request_timeout: 60
+    max_retries: 3
+  # Ollama本地模型配置
+  ollama:
+    model: "qwen2:7b"
+    base_url: "http://localhost:11434"
+
+# Agent 配置
+agent:
+  # 最大推理步数（每步可能调用一个工具）
+  max_steps: 6
+  # Agent 是否打印中间步骤
+  verbose: true
+  # 是否默认使用 Agent 模式（否则使用原有 RAG 模式）
+  default_mode: "agent"
+
+# 联网搜索配置
+web_search:
+  enabled: true
+  # 搜索引擎：duckduckgo 或 tavily
+  engine: "duckduckgo"
+  # 搜索结果数量
+  max_results: 3
+
+# API服务配置
+api:
+  host: "0.0.0.0"
+  port: 8000
+  title: "法律RAG知识库API"
+  description: "法律咨询与法规查询API服务"
+  version: "1.0.0"
+
+# 日志配置
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
