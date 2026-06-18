@@ -1,5 +1,5 @@
 """
-法律LLM封装 - 支持OpenAI和Ollama
+法律LLM封装 - 支持 MiniMax / DeepSeek / OpenAI / Ollama
 """
 from typing import Optional, List
 from langchain_core.language_models import BaseChatModel
@@ -7,7 +7,7 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
 
 class LegalLLM:
-    """法律LLM封装"""
+    """法律LLM封装 — 支持 MiniMax / DeepSeek / OpenAI 等 OpenAI 兼容 API"""
 
     # 法律问题专用提示词
     LEGAL_PROMPT = """你是一个专业的法律助手，专门回答中国法律相关问题。
@@ -56,19 +56,6 @@ class LegalLLM:
         ollama_base_url: Optional[str] = None,
         request_timeout: int = 60,
     ):
-        """
-        初始化法律LLM
-
-        Args:
-            provider: 提供商 (openai/ollama)
-            model: 模型名称
-            temperature: 温度参数
-            max_tokens: 最大token数
-            api_key: API密钥
-            base_url: API基础URL
-            ollama_base_url: Ollama基础URL
-            request_timeout: 请求超时时间（秒）
-        """
         self.provider = provider
         self.model = model
         self.temperature = temperature
@@ -77,16 +64,9 @@ class LegalLLM:
         self.base_url = base_url
         self.ollama_base_url = ollama_base_url
         self.request_timeout = request_timeout
-
         self._llm: Optional[BaseChatModel] = None
 
     def get_llm(self) -> BaseChatModel:
-        """
-        获取LLM实例
-
-        Returns:
-            LLM实例
-        """
         if self._llm is None:
             if self.provider == "openai":
                 self._llm = self._create_openai_llm()
@@ -97,9 +77,7 @@ class LegalLLM:
         return self._llm
 
     def _create_openai_llm(self) -> BaseChatModel:
-        """创建OpenAI LLM"""
         from langchain_openai import ChatOpenAI
-
         return ChatOpenAI(
             model=self.model or "gpt-3.5-turbo",
             temperature=self.temperature,
@@ -111,9 +89,7 @@ class LegalLLM:
         )
 
     def _create_ollama_llm(self) -> BaseChatModel:
-        """创建Ollama LLM"""
         from langchain_ollama import ChatOllama
-
         return ChatOllama(
             model=self.model or "qwen2:7b",
             temperature=self.temperature,
@@ -121,60 +97,21 @@ class LegalLLM:
             base_url=self.ollama_base_url or "http://localhost:11434",
         )
 
-    def generate_answer(
-        self,
-        query: str,
-        context: str,
-        chat_history: Optional[List] = None,
-        is_legal_query: bool = True,
-    ) -> str:
-        """
-        生成回答
-
-        Args:
-            query: 用户问题
-            context: 检索到的上下文
-            chat_history: 聊天历史
-            is_legal_query: 是否是法律查询
-
-        Returns:
-            生成的回答
-        """
+    def generate_answer(self, query, context, chat_history=None, is_legal_query=True) -> str:
         llm = self.get_llm()
-
-        # 根据查询类型选择提示词
         system_prompt = self.LEGAL_PROMPT if is_legal_query else self.GENERAL_PROMPT
-
-        # 构建消息
-        messages = [
-            SystemMessage(content=system_prompt),
-        ]
-
-        # 添加聊天历史
+        messages = [SystemMessage(content=system_prompt)]
         if chat_history:
-            for item in chat_history[-5:]:  # 只保留最近5轮
+            for item in chat_history[-5:]:
                 if item.get("role") == "user":
                     messages.append(HumanMessage(content=item["content"]))
                 elif item.get("role") == "assistant":
                     messages.append(AIMessage(content=item["content"]))
-
-        # 根据查询类型构建不同的提示
         if is_legal_query and context:
-            prompt = f"""基于以下法律信息回答用户问题。
-
-【法律信息】
-{context}
-
-【用户问题】
-{query}
-
-请提供准确、专业的回答，并引用相关法律条款。"""
+            prompt = f"基于以下法律信息回答用户问题。\n\n【法律信息】\n{context}\n\n【用户问题】\n{query}\n\n请提供准确、专业的回答，并引用相关法律条款。"
         else:
             prompt = query
-
         messages.append(HumanMessage(content=prompt))
-
-        # 生成回答
         try:
             response = llm.invoke(messages)
             return response.content
@@ -185,22 +122,8 @@ class LegalLLM:
             else:
                 return f"抱歉，生成回答时出现错误：{error_msg}"
 
-    def chat_with_history(
-        self,
-        messages: list,
-    ) -> str:
-        """
-        通用对话接口 — 直接传入完整消息列表，返回 LLM 文本响应。
-        供 Agent 循环等需要精细控制消息结构的场景使用。
-
-        Args:
-            messages: 消息列表，每项为 {"role": "system"/"user"/"assistant", "content": "..."}
-
-        Returns:
-            LLM 响应文本
-        """
-        from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-
+    def chat_with_history(self, messages: list) -> str:
+        """通用对话接口"""
         llm = self.get_llm()
         lc_messages = []
         for msg in messages:
@@ -212,7 +135,6 @@ class LegalLLM:
                 lc_messages.append(AIMessage(content=content))
             else:
                 lc_messages.append(HumanMessage(content=content))
-
         try:
             response = llm.invoke(lc_messages)
             return response.content
@@ -223,21 +145,12 @@ class LegalLLM:
             else:
                 return f"抱歉，生成回答时出现错误：{error_msg}"
 
-    def chat_with_history_stream(
-        self,
-        messages: list,
-    ):
+    def chat_with_history_stream(self, messages: list):
         """
-        流式对话接口 — 逐 Token yield，供 Agent 和 UI 实时展示
-
-        Args:
-            messages: 消息列表
-
-        Yields:
-            str — 每个 Token
+        流式对话接口 — 逐 Token yield。
+        内置 MiniMax-M1 think 标签剥离：跨 chunk 缓冲，自动过滤。
         """
-        from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-
+        import re as _re
         llm = self.get_llm()
         lc_messages = []
         for msg in messages:
@@ -250,14 +163,37 @@ class LegalLLM:
             else:
                 lc_messages.append(HumanMessage(content=content))
 
+        buf = ""
+        in_think = False
+
         try:
             for chunk in llm.stream(lc_messages):
-                if chunk.content:
-                    yield chunk.content
+                if not chunk.content:
+                    continue
+                buf += chunk.content
+
+                while True:
+                    if not in_think:
+                        m = _re.search(r'<\s*think\s*>', buf, _re.IGNORECASE)
+                        if not m:
+                            yield buf; buf = ""; break
+                        if m.start() > 0:
+                            yield buf[:m.start()]
+                        buf = buf[m.end():]
+                        in_think = True
+                    else:
+                        m = _re.search(r'<\s*/\s*think\s*>', buf, _re.IGNORECASE)
+                        if not m:
+                            break
+                        buf = buf[m.end():]
+                        in_think = False
+
+            if not in_think and buf.strip():
+                yield buf
+
         except Exception as e:
-            yield f"\n[流式错误: {str(e)}]"
+            yield f"\n[stream error: {str(e)}]"
 
     @property
     def llm(self) -> BaseChatModel:
-        """获取LLM的属性访问"""
         return self.get_llm()

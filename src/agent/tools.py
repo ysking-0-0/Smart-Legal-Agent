@@ -9,7 +9,7 @@ from langchain_core.documents import Document
 
 
 class AgentTools:
-    """Agent 工具集：search_laws / search_cases / search_web"""
+    """Agent 工具集：search_laws / search_cases / search_web / calculate"""
 
     def __init__(self, vector_store, top_k: int = 5):
         self.vector_store = vector_store
@@ -44,28 +44,52 @@ class AgentTools:
                 ),
                 "parameters": {"query": "string — 搜索查询字符串"},
             },
+            {
+                "name": "calculate",
+                "description": (
+                    "确定性法律费用计算器。严格按照《诉讼费用交纳办法》（国务院令第481号）"
+                    "的阶梯费率表精确计算财产案件的诉讼费用，不依赖大模型口算。"
+                    "适用于：计算诉讼费、案件受理费。"
+                    "参数 query 应该是标的金额（数字），如 '300000' 或 '标的额30万'。"
+                    "重要：涉及金钱计算的场景必须使用此工具，禁止自行估算或口算。"
+                ),
+                "parameters": {"query": "string — 标的金额（人民币元），如 300000"},
+            },
         ]
 
     # ── 工具执行（带超时保护） ──
 
     def execute(self, tool_name: str, query: str, timeout_sec: int = 30) -> str:
         """
-        执行工具调用，带超时保护。
+        执行工具调用，带超时保护 + JSON 解包。
 
-        用 ThreadPoolExecutor 包裹执行，防止 BGE 加载或 ChromaDB 查询
-        在网络异常时无限阻塞。
+        部分 LLM 输出 Action Input 为 JSON 格式如 {"query": "xxx"}，
+        这里自动提取 query 字段。
         """
         import concurrent.futures
 
+        # ── JSON 解包 ──
+        actual_query = query
+        if query.strip().startswith("{"):
+            try:
+                import json as _json
+                data = _json.loads(query)
+                if isinstance(data, dict) and "query" in data:
+                    actual_query = data["query"]
+            except Exception:
+                pass  # 解析失败保持原样
+
         def _run():
             if tool_name == "search_laws":
-                return self._search_laws(query)
+                return self._search_laws(actual_query)
             elif tool_name == "search_cases":
-                return self._search_cases(query)
+                return self._search_cases(actual_query)
             elif tool_name == "search_web":
-                return self._search_web(query)
+                return self._search_web(actual_query)
+            elif tool_name == "calculate":
+                return calculate_litigation_costs(actual_query)
             else:
-                return f"错误：未知工具 '{tool_name}'，可用工具：search_laws, search_cases, search_web"
+                return f"错误：未知工具 '{tool_name}'，可用工具：search_laws, search_cases, search_web, calculate"
 
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
@@ -197,3 +221,128 @@ class AgentTools:
                 + f"内容：\n{content}\n"
             )
         return "\n".join(parts)
+
+
+# ──────────────────────────────────────────────
+#  确定性计算器：诉讼费用（独立函数，非类方法）
+# ──────────────────────────────────────────────
+
+# 《诉讼费用交纳办法》（国务院令第481号）— 财产案件阶梯费率表
+_LITIGATION_TIERS = [
+    # (区间上限, 费率, 速算扣除数)
+    # 速算扣除数 = 上一区间满额费用 — 本区间下限 × 费率
+    # 公式：受理费 = 标的额 × 费率 — 速算扣除数（用于简化计算）
+    (0,          0,      0),       # 占位，不用
+    (10_000,     0,      50),      # ≤1万：固定50元
+    (100_000,    0.025,  200),     # 1-10万：2.5%，速算扣除=50 - 10000×0.025 = -200
+    (200_000,    0.020,  700),     # 10-20万：2.0%，速算扣除=2450 - 100000×0.020 = 450... 
+    (500_000,    0.015,  1700),    # 20-50万：1.5%
+    (1_000_000,  0.010,  4200),    # 50-100万：1.0%
+    (2_000_000,  0.009,  5200),    # 100-200万：0.9%
+    (5_000_000,  0.008,  7200),    # 200-500万：0.8%
+    (10_000_000, 0.007,  12200),   # 500-1000万：0.7%
+    (20_000_000, 0.006,  22200),   # 1000-2000万：0.6%
+    (float("inf"), 0.005, 42200),  # >2000万：0.5%
+]
+
+# 精确速算扣除数（逐区间验证）
+_LITIGATION_QUICK = [
+    (0,           0,      50),     # ≤1万
+    (10_000,      0.025,  -200),   # 实际公式：50固定 + 超出部分×2.5%
+    (100_000,     0.020,  300),    # 50+90000×2.5%=2300，2300-100000×2.0%=300
+    (200_000,     0.015,  1300),   # 2300+100000×2.0%=4300，4300-200000×1.5%=1300
+    (500_000,     0.010,  3800),   # 4300+300000×1.5%=8800，8800-500000×1.0%=3800
+    (1_000_000,   0.009,  4800),   # 8800+500000×1.0%=13800，13800-1000000×0.9%=4800
+    (2_000_000,   0.008,  6800),   # 13800+1000000×0.9%=22800，22800-2000000×0.8%=6800
+    (5_000_000,   0.007,  11800),  # 22800+3000000×0.8%=46800，46800-5000000×0.7%=11800
+    (10_000_000,  0.006,  21800),  # 46800+5000000×0.7%=81800，81800-10000000×0.6%=21800
+    (20_000_000,  0.005,  41800),  # 81800+10000000×0.6%=141800，141800-20000000×0.5%=41800
+    (float("inf"), 0.005,  41800), # >2000万：141800 + 超出部分的0.5%（或用速算公式）
+]
+
+
+def calculate_litigation_costs(query: str) -> str:
+    """
+    严格按《诉讼费用交纳办法》（国务院令第481号）计算财产案件受理费。
+
+    支持输入格式：
+    - 纯数字："300000"
+    - 带"万"："30万"、"30万元"
+    - 描述性："标的额30万"、"300000元"
+
+    返回：分阶梯明细 + 最终总额
+    """
+    import re
+
+    # ── 1. 解析金额 ──
+    amount_raw = query.strip()
+
+    # 匹配 "XX万" 模式
+    wan_match = re.search(r'(\d+\.?\d*)\s*万', amount_raw)
+    if wan_match:
+        amount = float(wan_match.group(1)) * 10000
+    else:
+        # 提取所有数字，取最大值（有些输入可能包含多个数字，取最可能的标的额）
+        nums = re.findall(r'\d+\.?\d*', amount_raw)
+        if not nums:
+            return (
+                f"【计算错误】无法从输入中解析出标的金额。\n"
+                f"原始输入：{query}\n"
+                f"请提供明确的数字，如 '300000' 或 '30万'。"
+            )
+        amount = float(nums[0])
+
+    if amount <= 0:
+        return f"【计算错误】标的金额必须大于 0，收到：{amount}"
+
+    amount = int(amount)
+
+    # ── 2. 阶梯计算 ──
+    if amount <= 10_000:
+        cost = 50
+        detail_lines = [
+            f"标的额 {amount:,} 元 ≤ 1 万元",
+            f"案件受理费：**50 元**（固定）",
+        ]
+    else:
+        # 使用阶梯累加计算
+        cost = 50  # 基础
+        remaining = amount - 10_000
+
+        tiers_detail = [
+            (100_000, 0.025, "1万 — 10万部分"),
+            (200_000, 0.020, "10万 — 20万部分"),
+            (500_000, 0.015, "20万 — 50万部分"),
+            (1_000_000, 0.010, "50万 — 100万部分"),
+            (2_000_000, 0.009, "100万 — 200万部分"),
+            (5_000_000, 0.008, "200万 — 500万部分"),
+            (10_000_000, 0.007, "500万 — 1000万部分"),
+            (20_000_000, 0.006, "1000万 — 2000万部分"),
+            (float("inf"), 0.005, "超过 2000万部分"),
+        ]
+
+        prev_limit = 10_000
+        detail_lines = [
+            f"标的额 {amount:,} 元，按《诉讼费用交纳办法》阶梯计算：\n",
+            f"  • 不超过 1 万元：**50 元**",
+        ]
+
+        for limit, rate, label in tiers_detail:
+            if amount > prev_limit:
+                segment = min(amount, limit) - prev_limit
+                if segment > 0:
+                    segment_cost = segment * rate
+                    cost += segment_cost
+                    detail_lines.append(
+                        f"  • {label}（{segment:,} 元 × {rate*100:.1f}%）：**{segment_cost:,.0f} 元**"
+                    )
+                prev_limit = limit
+            else:
+                break
+
+    # ── 3. 格式化输出 ──
+    detail_lines.append(f"\n💰 **案件受理费合计：{cost:,.0f} 元**")
+    detail_lines.append(f"\n> 依据：《诉讼费用交纳办法》（国务院令第481号）第十三条")
+
+    return "\n".join(detail_lines)
+

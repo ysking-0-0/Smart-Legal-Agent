@@ -11,6 +11,7 @@ from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field
 
 from .tools import AgentTools
+from .critic import LegalCritic, CriticReview
 
 
 @dataclass
@@ -50,6 +51,7 @@ class LegalAgent:
         "租房", "买房", "房产", "产权",
         "闯红灯", "违章", "扣分", "酒驾", "醉驾", "驾驶",
         "被捕", "被抓", "被查", "警察", "法院", "法官", "律师",
+        "诉讼费", "起诉", "标的额", "标的", "受理费", "计算",
         "赔", "欠款", "借条", "欠条", "押金", "退租",
         "公司", "裁员", "试用期", "劳动合同", "五险一金",
         "伤人", "打架", "盗窃", "诈骗", "抢劫",
@@ -66,36 +68,69 @@ class LegalAgent:
 
     SYSTEM_PROMPT = """你是一个专业的中国法律助手（Legal Agent），具备多步推理能力。
 
+## CRITICAL: FORMAT ENFORCEMENT (最高优先级)
+
+YOU MUST ALWAYS REPLY IN ONE OF THE FOLLOWING FORMATS. NO EXCEPTIONS.
+Direct answers, explanations, or any text outside these formats are STRICTLY FORBIDDEN.
+
+### CORRECT FORMAT — To call a tool:
+```
+Thought: [your reasoning in Chinese]
+Action: [exact tool name: search_laws search_cases search_web calculate]
+Action Input: [query string for the tool]
+```
+
+### CORRECT FORMAT — To give final answer:
+```
+Thought: [summary of all gathered information]
+Final Answer: [complete legal analysis for the user]
+```
+
+### WRONG — These are FORBIDDEN and will BREAK the system:
+- Answering directly without calling tools first
+- Writing "Answer:" instead of "Final Answer:"
+- Using any other format or free-form text
+- Skipping the Thought line
+
+### FEW-SHOT EXAMPLES:
+
+Example 1 — Legal query that requires tool:
+User: "酒后驾驶怎么处罚？"
+WRONG: "酒后驾驶会被罚款和扣分..." <-- FORBIDDEN
+CORRECT:
+Thought: 用户询问酒后驾驶的处罚规定，需要检索《道路交通安全法》相关条款。
+Action: search_laws
+Action Input: 酒后驾驶 处罚 道路交通安全法 第九十一条
+
+Example 2 — Calculation query that requires tool:
+User: "标的额30万，诉讼费多少？"
+CORRECT:
+Thought: 用户需要计算诉讼费，这是确定性数学计算，必须调用 calculate 工具。
+Action: calculate
+Action Input: 300000
+
+Example 3 — After gathering enough information, give final answer:
+CORRECT:
+Thought: 已检索到《道路交通安全法》第九十一条，明确了饮酒驾驶和醉酒驾驶的处罚。可以给出完整分析。
+Final Answer: 根据《中华人民共和国道路交通安全法》...
+
 ## 你的能力
 你可以使用以下工具来获取信息：
 {tool_descriptions}
 
 ## 工作流程
-面对用户的法律问题，你应该按以下步骤思考：
-
 1. **事实提取**：从用户描述中提炼关键法律事实（主体、行为、后果、时间、地点等）
 2. **法条检索**：调用 search_laws 查找相关法律规定，明确法律定性
 3. **案例检索**：调用 search_cases 查找类似判例，了解司法实践
-4. **综合分析**：结合法条和案例，给出全面的法律分析
+4. **费用/赔偿计算**：涉及诉讼费、赔偿金等数学计算时，必须调用 calculate 工具。禁止自行估算或口算数字。
+5. **综合分析**：结合法条、案例和计算结果，给出全面的法律分析
 
-如果知识库信息不足，可以调用 search_web 联网搜索补充。
-
-## 回答格式（严格遵守）
-
-每次响应必须遵循以下格式之一：
-
-### 需要调用工具时：
-```
-Thought: [你的推理过程 — 当前已知什么、还需要知道什么、为什么选择这个工具]
-Action: [工具名称 — search_laws, search_cases, search_web]
-Action Input: [传给工具的查询字符串]
-```
-
-### 准备最终回答时：
-```
-Thought: [最终推理 — 总结所有获取的信息，得出结论]
-Final Answer: [给用户的完整回答]
-```
+## 最终回答要求
+- 先定性：说明该行为在法律上属于什么性质（行政违法/刑事犯罪/民事纠纷）
+- 引法条：引用具体法律条款，格式如《中华人民共和国道路交通安全法》第九十一条
+- 列处罚：说明对应的法律后果
+- 举案例：如有相关案例，简要说明
+- 给建议：基于法律规定给出下一步行动建议
 
 ## 最终回答要求
 - 先定性：说明该行为在法律上属于什么性质（行政违法/刑事犯罪/民事纠纷）
@@ -135,6 +170,9 @@ Final Answer: [给用户的完整回答]
 
         # 初始化工具
         self.tools = AgentTools(vector_store=vector_store, top_k=top_k)
+
+        # 初始化 Critic（法条校验 Agent）
+        self.critic = LegalCritic(vector_store=vector_store, llm=llm)
 
         # 预热向量存储 — 首次调用触发 BGE 模型加载，避免后续卡顿
         self._warmup_vector_store()
@@ -331,6 +369,45 @@ Final Answer: [给用户的完整回答]
             is_legal_query=False,
         )
 
+    # ── Critic 审核循环（Generator-Critic 双 Agent） ──
+
+    MAX_CRITIC_LOOPS = 2
+
+    def _do_critic_review(self, draft_answer: str, query: str):
+        """
+        Critic 审核 → 逐事件 yield（供 run_stream 调用）
+
+        Yields: critic_start, critic_step, critic_correction, critic_pass, critic_refs
+        """
+        yield {"type": "critic_start"}
+
+        # 本地库核验
+        yield {
+            "type": "critic_step",
+            "phase": "local_check",
+            "detail": "Critic 正在比对本地知识库中的法条原文...",
+        }
+
+        review = self.critic.review(draft_answer, query)
+
+        if review.refs:
+            yield {
+                "type": "critic_step",
+                "phase": "web_search",
+                "detail": f"本地库未完全覆盖，已联网核验 {len(review.refs)} 条法条",
+            }
+
+        if not review.passed:
+            yield {
+                "type": "critic_correction",
+                "message": review.corrections,
+            }
+        else:
+            yield {"type": "critic_pass"}
+
+        if review.refs:
+            yield {"type": "critic_refs", "refs": review.refs}
+
     # ── 流式 Agent 循环 ──
 
     def run_stream(
@@ -399,7 +476,7 @@ Final Answer: [给用户的完整回答]
             # 解析完整响应
             thought, action, action_input, final_answer = self._parse_response(response_text)
 
-            # ── 最终回答 ──
+            # ── 最终回答（经过 Critic 审核）──
             if final_answer and final_answer.strip():
                 step = AgentStep(
                     step_num=step_num, thought=thought,
@@ -411,6 +488,13 @@ Final Answer: [给用户的完整回答]
                 for char in final_answer:
                     yield {"type": "answer_token", "token": char}
 
+                # ── Critic 审核 ──
+                refs = []
+                for critic_ev in self._do_critic_review(final_answer, query):
+                    yield critic_ev
+                    if critic_ev.get("type") == "critic_refs":
+                        refs = critic_ev.get("refs", [])
+
                 yield {
                     "type": "done",
                     "answer": final_answer,
@@ -421,11 +505,12 @@ Final Answer: [给用户的完整回答]
                     } for s in steps],
                     "tool_calls_count": tool_calls_count,
                     "is_legal_query": True,
+                    "refs": refs,
                 }
                 return
 
             # ── 工具调用（严格校验：action 必须是已知工具名） ──
-            VALID_ACTIONS = {"search_laws", "search_cases", "search_web"}
+            VALID_ACTIONS = {"search_laws", "search_cases", "search_web", "calculate"}
             if action and action_input and action.strip() in VALID_ACTIONS:
                 yield {
                     "type": "action",
@@ -456,10 +541,14 @@ Final Answer: [给用户的完整回答]
                 continue
 
             # ── 无法解析 / LLM 未遵循 ReAct 格式 ──
-            # 防御：把整个 response_text 当作最终回答
             answer_text = response_text.strip() or "分析未能生成，请重试。"
             for char in answer_text:
                 yield {"type": "answer_token", "token": char}
+            refs = []
+            for critic_ev in self._do_critic_review(answer_text, query):
+                yield critic_ev
+                if critic_ev.get("type") == "critic_refs":
+                    refs = critic_ev.get("refs", [])
             yield {
                 "type": "done",
                 "answer": answer_text,
@@ -470,6 +559,7 @@ Final Answer: [给用户的完整回答]
                 } for s in steps],
                 "tool_calls_count": tool_calls_count,
                 "is_legal_query": True,
+                "refs": refs,
             }
             return
 
@@ -479,11 +569,15 @@ Final Answer: [给用户的完整回答]
             "content": "已达到最大搜索步数。请基于目前已获取的所有信息，给出最终回答。"
         })
         final_response = self.llm.chat_with_history(conversation)
-        # 解析出 Final Answer 部分（去掉可能的 Thought 前缀）
         _, _, _, parsed_answer = self._parse_response(final_response)
         answer_text = parsed_answer if parsed_answer else final_response
         for char in answer_text:
             yield {"type": "answer_token", "token": char}
+        refs = []
+        for critic_ev in self._do_critic_review(answer_text, query):
+            yield critic_ev
+            if critic_ev.get("type") == "critic_refs":
+                refs = critic_ev.get("refs", [])
         yield {
             "type": "done",
             "answer": answer_text,
@@ -494,6 +588,7 @@ Final Answer: [给用户的完整回答]
             } for s in steps],
             "tool_calls_count": tool_calls_count,
             "is_legal_query": True,
+            "refs": refs,
         }
 
     def _build_system_prompt(self) -> str:
@@ -508,14 +603,16 @@ Final Answer: [给用户的完整回答]
             tool_descriptions="\n".join(tool_descs)
         )
 
+    # 已知工具名（用于从粘连文本中回退匹配）
+    _KNOWN_ACTIONS = {"calculate", "search_laws", "search_cases", "search_web"}
+
     def _parse_response(self, text: str) -> tuple:
         """
-        解析 LLM 响应 — 防御性版本
+        解析 LLM 响应 — 防线 V4
 
-        兼容 LLM 输出的微小格式偏差：
-        - "Thought:" / "thought:" 大小写
-        - 中英文混排
-        - Final Answer 后有多余内容
+        新增防御：
+        - Action: XAction Input: Y → 自动插入换行符
+        - Action 名只匹配已知工具名（杜绝 false positive）
 
         Returns:
             (thought, action, action_input, final_answer)
@@ -523,18 +620,28 @@ Final Answer: [给用户的完整回答]
         if not text or not isinstance(text, str):
             return ("", "", "", "")
 
+        # ── 防御 0：修复粘连格式 Action: calculateAction Input: 1500000 ──
+        text = re.sub(
+            r'(Action\s*[:：]\s*(?:' + '|'.join(self._KNOWN_ACTIONS) + r'))'
+            r'(Action\s*Input\s*[:：])',
+            r'\1\n\2',
+            text, flags=re.IGNORECASE
+        )
+
         thought = ""
         action = ""
         action_input = ""
         final_answer = ""
 
-        # ── Final Answer（先检查，因为可能有 Thought + Final Answer 同时出现）──
+        # ── Final Answer ──
         final_match = re.search(
-            r'Final\s*Answer\s*[:：]\s*(.+)', text, re.DOTALL | re.IGNORECASE
+            r'(?:Final\s*)?Answer\s*[:：]\s*(.+)', text, re.DOTALL | re.IGNORECASE
         )
+        if not final_match:
+            final_match = re.search(r'最终\s*(?:回答|答案)\s*[:：]\s*(.+)', text, re.DOTALL)
+
         if final_match:
             final_answer = final_match.group(1).strip()
-            # 提取 Final Answer 之前的 Thought
             pre_final = text[:final_match.start()]
             thought_m = re.search(
                 r'Thought\s*[:：]\s*(.+?)$', pre_final, re.DOTALL | re.IGNORECASE
@@ -551,16 +658,19 @@ Final Answer: [给用户的完整回答]
         if thought_match:
             thought = thought_match.group(1).strip()
 
-        # ── Action ──
-        action_match = re.search(
-            r'Action\s*[:：]\s*(\S+)', text, re.IGNORECASE
-        )
-        if action_match:
-            action = action_match.group(1).strip().rstrip(".,;")
+        # ── Action（只匹配已知工具名，杜绝 calculateAction 这种粘连匹配）──
+        for known in self._KNOWN_ACTIONS:
+            m = re.search(
+                rf'Action\s*[:：]\s*{re.escape(known)}\b',
+                text, re.IGNORECASE
+            )
+            if m:
+                action = known
+                break
 
-        # ── Action Input ──
+        # ── Action Input（更宽容：不要求前有换行）──
         input_match = re.search(
-            r'Action\s*Input\s*[:：]\s*(.+?)(?=\n\s*(?:Observation|Thought|Action|Final)|\Z)',
+            r'Action\s*Input\s*[:：]\s*(.+?)(?=\n\s*(?:Observation|Thought|Action|Final|$)|\Z)',
             text, re.DOTALL | re.IGNORECASE
         )
         if input_match:

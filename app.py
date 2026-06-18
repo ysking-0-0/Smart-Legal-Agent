@@ -106,6 +106,95 @@ def display_sidebar():
 
 # ── 流式 Agent 响应处理器 ──
 
+def _render_thought_block(placeholder, text: str):
+    """渲染思考块 — 半透明淡色等宽字体样式（占位符模式：替换不追加）"""
+    # 截断：去掉 "Final Answer:" 及之后的内容，防止污染推理区
+    import re
+    clean = re.split(r'\n\s*(?:Final\s*)?Answer\s*[:：]', text, maxsplit=1)[0]
+    clean = clean.rstrip()
+    safe = clean.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    placeholder.markdown(
+        f"""<div style="
+            background: rgba(240, 244, 248, 0.06);
+            color: #94a3b8;
+            font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+            font-size: 13px;
+            border-left: 3px solid rgba(148, 163, 184, 0.25);
+            border-radius: 0 6px 6px 0;
+            padding: 10px 14px;
+            margin: 4px 0;
+            white-space: pre-wrap;
+            line-height: 1.65;
+            max-height: 360px;
+            overflow-y: auto;
+        ">{safe}</div>""",
+        unsafe_allow_html=True,
+    )
+
+
+def _render_observation_block(placeholder, text: str):
+    """渲染工具返回结果 — 绿色调，区别于思考块"""
+    # 截断过长的结果
+    display = text[:500] + ("..." if len(text) > 500 else "")
+    safe = display.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    placeholder.markdown(
+        f"""<div style="
+            background: rgba(16, 185, 129, 0.06);
+            color: #6ee7b7;
+            font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+            font-size: 12px;
+            border-left: 3px solid rgba(16, 185, 129, 0.3);
+            border-radius: 0 6px 6px 0;
+            padding: 8px 14px;
+            margin: 4px 0 4px 8px;
+            white-space: pre-wrap;
+            line-height: 1.55;
+            max-height: 200px;
+            overflow-y: auto;
+        ">{safe}</div>""",
+        unsafe_allow_html=True,
+    )
+
+
+def _render_step_summary(i: int, step: dict, labels: dict):
+    """渲染步骤摘要 — 小巧的标签式展示"""
+    action = step.get("action", "")
+    label = labels.get(action, action)
+    inp = (step.get("action_input", "") or "")[:80]
+    st.markdown(
+        f"""<div style="
+            display: flex;
+            align-items: baseline;
+            gap: 8px;
+            padding: 4px 0;
+            font-size: 13px;
+        ">
+            <span style="
+                color: #64748b;
+                font-weight: 600;
+                min-width: 44px;
+            ">Step {i}</span>
+            <span style="
+                background: rgba(99, 102, 241, 0.12);
+                color: #a5b4fc;
+                padding: 2px 8px;
+                border-radius: 4px;
+                font-size: 12px;
+                font-family: monospace;
+            ">{label}</span>
+            <span style="
+                color: #94a3b8;
+                font-family: monospace;
+                font-size: 12px;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            ">{inp}</span>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
+
 def render_streaming_response(agent: LegalAgent, query: str, chat_history: list):
     """
     消费 agent.run_stream() 流式事件，实时更新 UI。
@@ -128,6 +217,7 @@ def render_streaming_response(agent: LegalAgent, query: str, chat_history: list)
         "🧠 智能思考与检索过程（点击展开）",
         expanded=True,
     )
+    thinking_placeholder = thinking_container.empty()  # 占位符：替换而非追加
     answer_area = st.empty()
 
     # ── 状态 ──
@@ -163,7 +253,7 @@ def render_streaming_response(agent: LegalAgent, query: str, chat_history: list)
         elif etype == "thought_token":
             if phase == "thinking":
                 thinking_lines.append(event["token"])
-                thinking_container.write("".join(thinking_lines))
+                _render_thought_block(thinking_placeholder, "".join(thinking_lines))
 
         # --- action ---
         elif etype == "action":
@@ -172,7 +262,7 @@ def render_streaming_response(agent: LegalAgent, query: str, chat_history: list)
                 f"🔧 {step_info} — {TOOL_LABELS.get(name, name)}：{event.get('input', '')[:60]}"
             )
             steps_data.append({
-                "thought": "".join(thinking_lines)[:300],
+                "thought": "".join(thinking_lines),  # 完整保存思考文本
                 "action": name,
                 "action_input": event.get("input", ""),
             })
@@ -181,6 +271,9 @@ def render_streaming_response(agent: LegalAgent, query: str, chat_history: list)
         elif etype == "observation":
             tool_calls_count += 1
             status_area.caption(f"📋 {step_info} — 检索完成")
+            # 保存工具返回结果到上一步
+            if steps_data:
+                steps_data[-1]["observation"] = event.get("content", "")
             thinking_lines = []
 
         # --- answer_token（切换阶段 + 自动折叠推理区） ---
@@ -199,6 +292,30 @@ def render_streaming_response(agent: LegalAgent, query: str, chat_history: list)
             final_answer += event["token"]
             answer_area.markdown(f"### 分析结论\n\n{final_answer}▌")
 
+        # --- critic_start ---
+        elif etype == "critic_start":
+            status_area.caption(f"🛡️ Critic 审核中 — 核验法条引用准确性...")
+
+        # --- critic_step ---
+        elif etype == "critic_step":
+            phase_label = {
+                "local_check": "🔍 Critic 本地核验 — 比对知识库原文",
+                "web_search": "🌐 Critic 联网升级 — 本地未命中，联网核对",
+            }.get(event.get("phase", ""), event.get("detail", ""))
+            status_area.caption(phase_label)
+
+        # --- critic_correction ---
+        elif etype == "critic_correction":
+            status_area.caption("⚠️ Critic 发现法条引用异常")
+
+        # --- critic_pass ---
+        elif etype == "critic_pass":
+            status_area.caption("✅ Critic 审核通过 — 法条引用准确")
+
+        # --- critic_refs ---
+        elif etype == "critic_refs":
+            pass  # refs 在 done 中统一处理
+
         # --- done（最终渲染 + 推理摘要写入折叠区） ---
         elif etype == "done":
             done_answer = event.get("answer", "") or final_answer
@@ -214,7 +331,16 @@ def render_streaming_response(agent: LegalAgent, query: str, chat_history: list)
                     _time.sleep(0.002)
 
             # 最终回答（无光标闪烁）
-            answer_area.markdown(f"### 分析结论\n\n{final_answer}")
+            refs = event.get("refs", [])
+            display_answer = final_answer
+            if refs:
+                # 追加上标引用
+                ref_notes = "\n\n---\n"
+                for i, r in enumerate(refs, 1):
+                    ref_notes += f"[{i}] [{r.get('title','链接')}]({r.get('url','#')})\n"
+                ref_notes += "\n🌐 本回答部分法条已通过互联网实时检索核验。"
+                display_answer = final_answer + ref_notes
+            answer_area.markdown(f"### 分析结论\n\n{display_answer}")
 
             # 简洁状态摘要
             status_area.caption(
@@ -223,7 +349,7 @@ def render_streaming_response(agent: LegalAgent, query: str, chat_history: list)
                 + (f" | 推理 {len(steps_data)} 步" if steps_data else "")
             )
 
-            # 推理摘要写入折叠区
+            # 推理摘要写入折叠区（保留完整 thought + action）
             if steps_data:
                 thinking_container.update(
                     label="🧠 推理过程（已自动收起，点击展开）",
@@ -232,8 +358,13 @@ def render_streaming_response(agent: LegalAgent, query: str, chat_history: list)
                 )
                 with thinking_container:
                     for i, s in enumerate(steps_data, 1):
-                        action_label = TOOL_LABELS.get(s.get("action", ""), s.get("action", ""))
-                        st.caption(f"**Step {i}**：{action_label} → {s.get('action_input', '')[:80]}")
+                        action_label = TOOL_LABELS.get(s.get('action',''), s.get('action',''))
+                        st.markdown(f"**Step {i}**：{action_label}  →  `{s.get('action_input','')[:80]}`")
+                        if s.get("thought", "").strip():
+                            _render_thought_block(st, s["thought"])
+                        if s.get("observation", "").strip():
+                            _render_observation_block(st, s["observation"])
+                        st.markdown("---")
             else:
                 thinking_container.update(
                     label="🧠 推理过程", state="complete", expanded=False
@@ -314,24 +445,63 @@ def main():
         with st.chat_message("user"):
             st.markdown(user_input)
 
-        # Agent 响应
-        agent = init_agent()
-        with st.chat_message("assistant"):
-            try:
-                chat_history = [
-                    {"role": m["role"], "content": m["content"]}
-                    for m in st.session_state.messages[:-1]
-                ]
+        # ── 路由守卫：非法律问题不初始化 Agent，直接轻量对话 ──
+        LEGAL_KW = [
+            "法律", "法规", "法条", "条款", "规定", "条例",
+            "犯罪", "刑罚", "处罚", "罚款", "拘留", "赔偿",
+            "合同", "协议", "离婚", "继承", "劳动", "解雇", "辞退",
+            "起诉", "诉讼", "判决", "仲裁", "法院", "法官", "律师",
+            "交通", "事故", "驾驶", "酒驾", "醉驾", "闯红灯", "违章",
+            "租房", "买房", "产权", "押金", "退租",
+            "公司", "裁员", "试用期", "工资", "欠款", "借条",
+            "打架", "盗窃", "诈骗", "抢劫", "伤人",
+            "诉讼费", "标的额", "受理费",
+        ]
+        is_quick_chat = not any(kw in user_input for kw in LEGAL_KW)
 
-                result = render_streaming_response(agent, user_input, chat_history)
-                st.session_state.messages.append(result)
+        chat_history = [
+            {"role": m["role"], "content": m["content"]}
+            for m in st.session_state.messages[:-1]
+        ]
 
-            except Exception as e:
-                st.error(f"查询失败: {str(e)}")
+        if is_quick_chat:
+            # 普通对话：跳过 Agent 初始化，直接用 LLM 回复
+            with st.chat_message("assistant"):
+                from src.llm.legal_llm import LegalLLM
+                llm = LegalLLM(
+                    provider=config.llm_provider,
+                    model=config.openai_model,
+                    api_key=config.openai_api_key,
+                    base_url=config.openai_base_url,
+                    request_timeout=30,
+                )
+                messages = [{"role": "system", "content": "你是一个友好的AI助手。"}]
+                messages.extend(chat_history[-4:])
+                messages.append({"role": "user", "content": user_input})
+                full = ""
+                placeholder = st.empty()
+                for token in llm.chat_with_history_stream(messages):
+                    full += token
+                    placeholder.markdown(full + "▌")
+                placeholder.markdown(full)
+                st.caption("💬 普通对话模式")
                 st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": f"查询失败: {str(e)}",
+                    "role": "assistant", "content": full,
+                    "is_legal_query": False,
                 })
+        else:
+            # 法律问题：初始化 Agent 并流式推理
+            agent = init_agent()
+            with st.chat_message("assistant"):
+                try:
+                    result = render_streaming_response(agent, user_input, chat_history)
+                    st.session_state.messages.append(result)
+                except Exception as e:
+                    st.error(f"查询失败: {str(e)}")
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": f"查询失败: {str(e)}",
+                    })
 
 
 if __name__ == "__main__":

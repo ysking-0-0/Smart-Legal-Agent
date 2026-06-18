@@ -51,15 +51,19 @@ retrieval:
 
 # LLM配置
 llm:
-  # 提供商：openai（兼容DeepSeek）或 ollama
+  # 提供商：openai（兼容 MiniMax / DeepSeek / OpenAI 等所有 OpenAI 兼容 API）
   provider: "openai"
-  # OpenAI/DeepSeek配置
+  # 当前模型：MiniMax-M3（官方最新旗舰模型）
   openai:
-    model: "deepseek-v4-flash"
+    model: "MiniMax-M3"
     temperature: 0.3
-    max_tokens: 2000
+    max_tokens: 4096
     request_timeout: 60
     max_retries: 3
+  # 备选方案
+  # openai:
+  #   model: "deepseek-v4-flash"           # DeepSeek
+  #   model: "gpt-4o-mini"                 # OpenAI
   # Ollama本地模型配置
   ollama:
     model: "qwen2:7b"
