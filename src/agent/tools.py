@@ -11,9 +11,16 @@ from langchain_core.documents import Document
 class AgentTools:
     """Agent 工具集：search_laws / search_cases / search_web / calculate"""
 
-    def __init__(self, vector_store, top_k: int = 5):
+    def __init__(self, vector_store, top_k: int = 5, retriever=None):
+        """
+        Args:
+            vector_store: ChromaVectorStore 实例
+            top_k: 检索返回数量
+            retriever: HybridRetriever 实例（可选，传入则启用 Dense+BM25+RRF）
+        """
         self.vector_store = vector_store
         self.top_k = top_k
+        self.retriever = retriever  # None = 纯 BGE dense；传入 = RRF 混合
 
     @staticmethod
     def tool_definitions() -> List[Dict[str, Any]]:
@@ -108,33 +115,35 @@ class AgentTools:
         try:
             t0 = time.time()
 
-            # 1. 向量检索（BGE 编码 + ChromaDB 查询）
-            t1 = time.time()
-            results = self.vector_store.similarity_search_with_score(
-                query, k=self.top_k * 2
-            )
-            t2 = time.time()
-            print(f"[search_laws] 向量检索完成: {len(results)} 条, "
-                  f"BGE编码={t1-t0:.1f}s, DB查询={t2-t1:.1f}s")
-
-            # 2. 后过滤：doc_type + 相似度阈值
-            DISTANCE_THRESHOLD = 1.2  # BGE L2 distance: <1.2 = relevant, >1.2 = noise
-            filtered = []
-            dropped = 0
-            for doc, score in results:
-                if score > DISTANCE_THRESHOLD:
-                    dropped += 1
-                    continue  # 低相似度噪音，丢弃
-                doc_type = doc.metadata.get("doc_type", "")
-                source = doc.metadata.get("source", "")
-                if doc_type in ("law", "custom") or (
-                    not doc_type and "cases" not in source.lower()
-                ):
-                    filtered.append((doc, score))
-                    if len(filtered) >= self.top_k:
-                        break
-
-            print(f"[search_laws] 检索={len(results)}条, 阈值过滤={dropped}条, 有效={len(filtered)}条, {time.time()-t0:.1f}s")
+            if self.retriever is not None:
+                # ── 生产路径：Hybrid Dense+BM25+RRF ──
+                docs = self.retriever.invoke(query)
+                # 后过滤：doc_type
+                filtered = []
+                for doc in docs:
+                    doc_type = doc.metadata.get("doc_type", "")
+                    source = doc.metadata.get("source", "")
+                    score = doc.metadata.get("rrf_score", doc.metadata.get("score", 0))
+                    if doc_type in ("law", "custom") or (
+                        not doc_type and "cases" not in source.lower()
+                    ):
+                        filtered.append((doc, score))
+                print(f"[search_laws] Hybrid RRF: {len(docs)}条 → {len(filtered)}条, {time.time()-t0:.1f}s")
+            else:
+                # ── 回退路径：纯 BGE dense ──
+                results = self.vector_store.similarity_search_with_score(query, k=self.top_k * 2)
+                DISTANCE_THRESHOLD = 1.2
+                filtered = []
+                for doc, score in results:
+                    if score > DISTANCE_THRESHOLD:
+                        continue
+                    doc_type = doc.metadata.get("doc_type", "")
+                    source = doc.metadata.get("source", "")
+                    if doc_type in ("law", "custom") or (
+                        not doc_type and "cases" not in source.lower()
+                    ):
+                        filtered.append((doc, score))
+                print(f"[search_laws] Dense only: {len(results)}条 → {len(filtered)}条, {time.time()-t0:.1f}s")
 
             if not filtered:
                 return (
@@ -142,7 +151,7 @@ class AgentTools:
                     "→ 建议调用 search_web 联网搜索补充。"
                 )
 
-            return self._format_results(filtered, "法律条文")
+            return self._format_results(filtered[:self.top_k], "法律条文")
 
         except Exception as e:
             print(f"[search_laws] 异常: {e}")
@@ -154,28 +163,32 @@ class AgentTools:
         try:
             t0 = time.time()
 
-            results = self.vector_store.similarity_search_with_score(
-                query, k=self.top_k * 2
-            )
-
-            # 相似度阈值过滤
-            DISTANCE_THRESHOLD = 1.2
-            filtered = []
-            dropped = 0
-            for doc, score in results:
-                if score > DISTANCE_THRESHOLD:
-                    dropped += 1
-                    continue
-                doc_type = doc.metadata.get("doc_type", "")
-                source = doc.metadata.get("source", "")
-                if doc_type == "case" or (
-                    not doc_type and "cases" in source.lower()
-                ):
-                    filtered.append((doc, score))
-                    if len(filtered) >= self.top_k:
-                        break
-
-            print(f"[search_cases] 检索={len(results)}条, 阈值过滤={dropped}条, 有效={len(filtered)}条, {time.time()-t0:.1f}s")
+            if self.retriever is not None:
+                docs = self.retriever.invoke(query)
+                filtered = []
+                for doc in docs:
+                    doc_type = doc.metadata.get("doc_type", "")
+                    source = doc.metadata.get("source", "")
+                    score = doc.metadata.get("rrf_score", doc.metadata.get("score", 0))
+                    if doc_type == "case" or (
+                        not doc_type and "cases" in source.lower()
+                    ):
+                        filtered.append((doc, score))
+                print(f"[search_cases] Hybrid RRF: {len(docs)}条 → {len(filtered)}条, {time.time()-t0:.1f}s")
+            else:
+                results = self.vector_store.similarity_search_with_score(query, k=self.top_k * 2)
+                DISTANCE_THRESHOLD = 1.2
+                filtered = []
+                for doc, score in results:
+                    if score > DISTANCE_THRESHOLD:
+                        continue
+                    doc_type = doc.metadata.get("doc_type", "")
+                    source = doc.metadata.get("source", "")
+                    if doc_type == "case" or (
+                        not doc_type and "cases" in source.lower()
+                    ):
+                        filtered.append((doc, score))
+                print(f"[search_cases] Dense only: {len(results)}条 → {len(filtered)}条, {time.time()-t0:.1f}s")
 
             if not filtered:
                 return (
@@ -183,7 +196,7 @@ class AgentTools:
                     "→ 建议调用 search_web 联网搜索真实案例补充。"
                 )
 
-            return self._format_results(filtered, "案例")
+            return self._format_results(filtered[:self.top_k], "案例")
 
         except Exception as e:
             print(f"[search_cases] 异常: {e}")

@@ -186,8 +186,18 @@ Final Answer: 根据《中华人民共和国道路交通安全法》...
         self.max_steps = max_steps
         self.verbose = verbose
 
-        # 初始化工具
-        self.tools = AgentTools(vector_store=vector_store, top_k=top_k)
+        # 初始化混合检索器（Dense + BM25 + RRF）
+        from ..retrieval.hybrid_retriever import HybridRetriever
+        self.hybrid_retriever = HybridRetriever(
+            vector_store=vector_store,
+            top_k=top_k,
+            dense_weight=0.5,
+            sparse_weight=0.5,
+            use_web_search=False,  # web search 由 Agent 的 search_web 工具单独处理
+        )
+
+        # 初始化工具（传入混合检索器）
+        self.tools = AgentTools(vector_store=vector_store, top_k=top_k, retriever=self.hybrid_retriever)
 
         # 初始化 Critic（法条校验 Agent）
         self.critic = LegalCritic(vector_store=vector_store, llm=llm)
