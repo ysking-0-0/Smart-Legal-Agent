@@ -117,9 +117,14 @@ class AgentTools:
             print(f"[search_laws] 向量检索完成: {len(results)} 条, "
                   f"BGE编码={t1-t0:.1f}s, DB查询={t2-t1:.1f}s")
 
-            # 2. 后过滤
+            # 2. 后过滤：doc_type + 相似度阈值
+            DISTANCE_THRESHOLD = 1.2  # BGE L2 distance: <1.2 = relevant, >1.2 = noise
             filtered = []
+            dropped = 0
             for doc, score in results:
+                if score > DISTANCE_THRESHOLD:
+                    dropped += 1
+                    continue  # 低相似度噪音，丢弃
                 doc_type = doc.metadata.get("doc_type", "")
                 source = doc.metadata.get("source", "")
                 if doc_type in ("law", "custom") or (
@@ -129,13 +134,15 @@ class AgentTools:
                     if len(filtered) >= self.top_k:
                         break
 
-            if not filtered:
-                print(f"[search_laws] 无匹配结果 (query='{query[:50]}')")
-                return "未找到相关法律条文。"
+            print(f"[search_laws] 检索={len(results)}条, 阈值过滤={dropped}条, 有效={len(filtered)}条, {time.time()-t0:.1f}s")
 
-            formatted = self._format_results(filtered, "法律条文")
-            print(f"[search_laws] 过滤后 {len(filtered)} 条, 总耗时 {time.time()-t0:.1f}s")
-            return formatted
+            if not filtered:
+                return (
+                    "【本地库检索结果】未找到相关法律条文。\n"
+                    "→ 建议调用 search_web 联网搜索补充。"
+                )
+
+            return self._format_results(filtered, "法律条文")
 
         except Exception as e:
             print(f"[search_laws] 异常: {e}")
@@ -151,11 +158,14 @@ class AgentTools:
                 query, k=self.top_k * 2
             )
 
-            t1 = time.time()
-            print(f"[search_cases] 向量检索: {len(results)} 条, {t1-t0:.1f}s")
-
+            # 相似度阈值过滤
+            DISTANCE_THRESHOLD = 1.2
             filtered = []
+            dropped = 0
             for doc, score in results:
+                if score > DISTANCE_THRESHOLD:
+                    dropped += 1
+                    continue
                 doc_type = doc.metadata.get("doc_type", "")
                 source = doc.metadata.get("source", "")
                 if doc_type == "case" or (
@@ -165,8 +175,13 @@ class AgentTools:
                     if len(filtered) >= self.top_k:
                         break
 
+            print(f"[search_cases] 检索={len(results)}条, 阈值过滤={dropped}条, 有效={len(filtered)}条, {time.time()-t0:.1f}s")
+
             if not filtered:
-                return "未找到相关案例。案例库可能尚未收录此类案件。"
+                return (
+                    "【本地库检索结果】未找到相关案例。\n"
+                    "→ 建议调用 search_web 联网搜索真实案例补充。"
+                )
 
             return self._format_results(filtered, "案例")
 

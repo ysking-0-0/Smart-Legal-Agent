@@ -218,6 +218,10 @@ def render_streaming_response(agent: LegalAgent, query: str, chat_history: list)
         expanded=True,
     )
     thinking_placeholder = thinking_container.empty()  # 占位符：替换而非追加
+    thinking_placeholder.markdown(
+        '<span style="color:#64748b;font-size:13px;">等待大模型开始推理...</span>',
+        unsafe_allow_html=True,
+    )
     answer_area = st.empty()
 
     # ── 状态 ──
@@ -227,6 +231,7 @@ def render_streaming_response(agent: LegalAgent, query: str, chat_history: list)
     steps_data: list[dict] = []
     tool_calls_count = 0
     is_legal = True
+    web_searched = False  # 本轮是否触发过联网搜索
     step_info = ""
 
     # ── 消费事件流 ──
@@ -235,13 +240,9 @@ def render_streaming_response(agent: LegalAgent, query: str, chat_history: list)
 
         # --- mode ---
         if etype == "mode":
-            is_legal = (event["mode"] == "legal")
-            if not is_legal:
-                phase = "answering"
-                thinking_container.update(
-                    label="💬 普通对话", state="complete", expanded=False
-                )
-                status_area.caption("智能路由：普通对话模式")
+            # 防御：main() 已判定为法律问题，强制 is_legal=True
+            is_legal = True
+            status_area.caption("⚖️ 法律分析模式 — 启动多步推理...")
 
         # --- step ---
         elif etype == "step":
@@ -258,6 +259,8 @@ def render_streaming_response(agent: LegalAgent, query: str, chat_history: list)
         # --- action ---
         elif etype == "action":
             name = event["action"]
+            if name == "search_web":
+                web_searched = True  # 标记本轮使用了联网搜索
             status_area.caption(
                 f"🔧 {step_info} — {TOOL_LABELS.get(name, name)}：{event.get('input', '')[:60]}"
             )
@@ -333,21 +336,37 @@ def render_streaming_response(agent: LegalAgent, query: str, chat_history: list)
             # 最终回答（无光标闪烁）
             refs = event.get("refs", [])
             display_answer = final_answer
-            if refs:
-                # 追加上标引用
-                ref_notes = "\n\n---\n"
-                for i, r in enumerate(refs, 1):
-                    ref_notes += f"[{i}] [{r.get('title','链接')}]({r.get('url','#')})\n"
-                ref_notes += "\n🌐 本回答部分法条已通过互联网实时检索核验。"
-                display_answer = final_answer + ref_notes
+
+            # 🌐 联网检索成果回填
+            if web_searched or refs:
+                badge = "\n\n---\n🌐 **本回答部分法条已通过互联网实时检索核验。**\n"
+                if refs:
+                    for i, r in enumerate(refs, 1):
+                        badge += f"\n[{i}] [{r.get('title','链接')}]({r.get('url','#')})"
+                display_answer = final_answer + badge
+
+            # 捕获 Final Answer 中的参考链接 [1] title | url 格式
+            import re as _re
+            inline_refs = _re.findall(r'\[(\d+)\]\s*(.+?)\s*\|\s*(https?://\S+)', final_answer)
+            if inline_refs:
+                ref_block = "\n\n---\n🌐 **本回答参考来源：**\n"
+                for num, title, url in inline_refs:
+                    ref_block += f"\n[{num}] [{title.strip()}]({url.strip()})"
+                display_answer += ref_block
+
             answer_area.markdown(f"### 分析结论\n\n{display_answer}")
 
-            # 简洁状态摘要
-            status_area.caption(
-                f"{'⚖️ 法律分析' if is_legal else '💬 普通对话'}"
-                f" | 检索 {tool_calls_count} 次"
-                + (f" | 推理 {len(steps_data)} 步" if steps_data else "")
-            )
+            # 状态摘要 — 强制法律模式标签
+            mode_label = "⚖️ 法律分析"
+            if web_searched:
+                mode_label += " + 🌐 联网"
+            if tool_calls_count > 0:
+                mode_label += f" | {tool_calls_count} 次检索"
+            if steps_data:
+                mode_label += f" | {len(steps_data)} 步推理"
+            if refs:
+                mode_label += f" | Critic 核验 {len(refs)} 条"
+            status_area.caption(mode_label)
 
             # 推理摘要写入折叠区（保留完整 thought + action）
             if steps_data:
@@ -377,11 +396,15 @@ def render_streaming_response(agent: LegalAgent, query: str, chat_history: list)
                 "steps_count": len(steps_data),
                 "tool_calls_count": tool_calls_count,
                 "is_legal_query": is_legal,
+                "web_searched": web_searched,
             }
 
     # 极端兜底
     if final_answer:
-        answer_area.markdown(f"### 分析结论\n\n{final_answer}")
+        display = final_answer
+        if web_searched:
+            display += "\n\n---\n🌐 **本回答部分法条已通过互联网实时检索核验。**"
+        answer_area.markdown(f"### 分析结论\n\n{display}")
     else:
         answer_area.markdown("### 分析结论\n\n分析未能完成，请重试。")
 
@@ -392,6 +415,7 @@ def render_streaming_response(agent: LegalAgent, query: str, chat_history: list)
         "steps_count": len(steps_data),
         "tool_calls_count": tool_calls_count,
         "is_legal_query": is_legal,
+        "web_searched": web_searched,
     }
 
 
@@ -410,14 +434,17 @@ def render_history():
                         if s.get("action"):
                             st.caption(f"动作：{s['action']}({s.get('action_input', '')[:100]})")
                         st.markdown("---")
+            # 模式标签
             if msg.get("is_legal_query") is False:
                 st.caption("💬 普通对话模式")
-            elif msg.get("tool_calls_count"):
-                st.caption(
-                    f"⚖️ 法律分析模式 | "
-                    f"调用了 {msg['tool_calls_count']} 次工具，"
-                    f"共 {msg.get('steps_count', 0)} 步"
-                )
+            else:
+                # 法律模式 — 始终显示 ⚖️，不显示 💬
+                tc = msg.get("tool_calls_count", 0)
+                sc = msg.get("steps_count", 0)
+                label = "⚖️ 法律分析模式"
+                if tc: label += f" | {tc} 次检索"
+                if sc: label += f" | {sc} 步推理"
+                st.caption(label)
 
 
 # ── 主函数 ──
@@ -447,15 +474,28 @@ def main():
 
         # ── 路由守卫：非法律问题不初始化 Agent，直接轻量对话 ──
         LEGAL_KW = [
-            "法律", "法规", "法条", "条款", "规定", "条例",
-            "犯罪", "刑罚", "处罚", "罚款", "拘留", "赔偿",
-            "合同", "协议", "离婚", "继承", "劳动", "解雇", "辞退",
-            "起诉", "诉讼", "判决", "仲裁", "法院", "法官", "律师",
-            "交通", "事故", "驾驶", "酒驾", "醉驾", "闯红灯", "违章",
-            "租房", "买房", "产权", "押金", "退租",
-            "公司", "裁员", "试用期", "工资", "欠款", "借条",
-            "打架", "盗窃", "诈骗", "抢劫", "伤人",
-            "诉讼费", "标的额", "受理费",
+            "法律", "法规", "法条", "条款", "规定", "条例", "办法",
+            "民法", "刑法", "行政法", "商法", "劳动法", "合同法",
+            "交通", "事故", "赔偿", "责任", "权利", "义务",
+            "起诉", "诉讼", "判决", "仲裁", "调解",
+            "犯罪", "刑罚", "处罚", "罚款", "拘留",
+            "合同", "协议", "契约", "签字", "盖章",
+            "离婚", "继承", "遗产", "婚姻", "家庭",
+            "劳动", "用工", "解雇", "辞退", "工资",
+            "租房", "买房", "房产", "产权",
+            "闯红灯", "违章", "扣分", "酒驾", "醉驾", "驾驶",
+            "被捕", "被抓", "被查", "警察", "法院", "法官", "律师",
+            "诉讼费", "起诉", "标的额", "标的", "受理费", "计算",
+            "赔", "欠款", "借条", "欠条", "押金", "退租",
+            "公司", "裁员", "试用期", "劳动合同", "五险一金",
+            "伤人", "打架", "盗窃", "诈骗", "抢劫",
+            "交警", "扣分", "触犯", "违法", "违规", "要紧",
+            "查酒驾", "吹气", "酒精", "检测", "吊销", "驾照",
+            "开除", "离职", "加班", "社保", "工伤",
+            "打官司", "上诉", "强制", "执行", "冻结", "查封",
+            "网贷", "高利贷", "套路贷", "担保", "抵押",
+            "泄露", "隐私", "诽谤", "名誉", "侵权",
+            "遗嘱", "抚养", "赡养", "监护",
         ]
         is_quick_chat = not any(kw in user_input for kw in LEGAL_KW)
 

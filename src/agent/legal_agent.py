@@ -55,6 +55,14 @@ class LegalAgent:
         "赔", "欠款", "借条", "欠条", "押金", "退租",
         "公司", "裁员", "试用期", "劳动合同", "五险一金",
         "伤人", "打架", "盗窃", "诈骗", "抢劫",
+        # v2 扩展：覆盖更多口语化法律咨询
+        "交警", "扣分", "触犯", "违法", "违规", "要紧",
+        "查酒驾", "吹气", "酒精", "检测", "吊销", "驾照",
+        "开除", "离职", "加班", "社保", "工伤",
+        "打官司", "上诉", "强制", "执行", "冻结", "查封",
+        "网贷", "高利贷", "套路贷", "担保", "抵押",
+        "泄露", "隐私", "诽谤", "名誉", "侵权",
+        "遗嘱", "抚养", "赡养", "监护",
     ]
 
     # ── 通用对话提示词（非法律问题） ──
@@ -108,6 +116,16 @@ CORRECT:
 Thought: 用户需要计算诉讼费，这是确定性数学计算，必须调用 calculate 工具。
 Action: calculate
 Action Input: 300000
+
+Example 3 — Local search returned EMPTY, MUST try web search:
+User: "劳动法裁员赔偿标准是什么？"
+WRONG: 直接给 Final Answer 或放弃搜索 <-- FORBIDDEN
+CORRECT:
+Thought: 本地库未找到劳动法相关内容，必须联网搜索。
+Action: search_web
+Action Input: 劳动法 裁员 经济补偿 赔偿标准
+
+### CRITICAL RULE: 如果 search_laws 或 search_cases 返回"未找到"或"建议联网"，你必须立即调用 search_web，禁止跳过联网直接给 Final Answer。
 
 Example 3 — After gathering enough information, give final answer:
 CORRECT:

@@ -107,10 +107,14 @@ class LegalCritic:
         return results
 
     def _check_local(self, law_name: str, article_num: str) -> dict:
+        """本地核对（含相似度阈值过滤）"""
         try:
             q = f"{law_name} 第{article_num}条" if article_num else law_name
             results = self.vector_store.similarity_search_with_score(q, k=3)
+            DISTANCE_THRESHOLD = 1.2
             for doc, score in results:
+                if score > DISTANCE_THRESHOLD:
+                    continue  # 相似度过低，丢弃
                 if law_name in doc.page_content:
                     if article_num:
                         if f"第{article_num}条" in doc.page_content:
