@@ -515,7 +515,7 @@ def main():
                     base_url=config.openai_base_url,
                     request_timeout=30,
                 )
-                messages = [{"role": "system", "content": "你是一个友好的AI助手。"}]
+                messages = [{"role": "system", "content": "你好！我是智能法律Agent助手，由YS个人开发。\n\n我的主要功能包括：\n\n日常问答 —— 我可以回答各类日常问题，与你进行普通的交流对话。\n法律咨询 —— 如果你有法律相关的问题，我会引导你详细描述具体情况，然后为你提供专业的法律分析和建议。\n请问有什么我可以帮助你的吗？(*^▽^*)"}]
                 messages.extend(chat_history[-4:])
                 messages.append({"role": "user", "content": user_input})
                 full = ""
